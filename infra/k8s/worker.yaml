@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crawler-worker
+  namespace: webcrawler
+  labels:
+    app: crawler-worker
+spec:
+  replicas: 4                    # ← change this to scale workers
+  selector:
+    matchLabels: { app: crawler-worker }
+  template:
+    metadata:
+      labels: { app: crawler-worker }
+    spec:
+      containers:
+        - name: worker
+          image: your-registry/crawler-worker:latest
+          command:
+            - celery
+            - -A
+            - backend.crawler.worker
+            - worker
+            - --loglevel=info
+            - -Q
+            - crawl
+            - --concurrency=8
+            - --prefetch-multiplier=1
+          env:
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef: { name: crawler-secrets, key: redis-url }
+            - name: CELERY_BROKER_URL
+              valueFrom:
+                secretKeyRef: { name: crawler-secrets, key: celery-broker }
+            - name: CELERY_RESULT_BACKEND
+              valueFrom:
+                secretKeyRef: { name: crawler-secrets, key: celery-result }
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: crawler-secrets, key: database-url }
+          resources:
+            requests: { memory: "512Mi", cpu: "500m" }
+            limits: { memory: "1.5Gi", cpu: "2000m" }
+          livenessProbe:
+            exec:
+              command: ["celery", "-A", "backend.crawler.worker", "inspect", "ping"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+---
+# HorizontalPodAutoscaler — auto-scales workers based on Redis queue depth
+# Requires custom metrics adapter (KEDA works great here)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: crawler-worker-hpa
+  namespace: webcrawler
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: crawler-worker
+  minReplicas: 1
+  maxReplicas: 50
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
