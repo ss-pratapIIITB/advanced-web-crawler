@@ -12,6 +12,11 @@ import redis.asyncio as aioredis
 from backend.config import settings
 
 
+def _domain_shard(domain: str) -> int:
+    """Consistent hash of domain → shard index 0..NUM_DOMAIN_QUEUES-1."""
+    return int(hashlib.md5(domain.encode()).hexdigest(), 16) % settings.num_domain_queues
+
+
 URL_QUEUED = "queued"
 URL_FETCHING = "fetching"
 URL_DONE = "done"
@@ -136,6 +141,58 @@ class URLFrontier:
 
     async def is_empty(self) -> bool:
         return await self.size() == 0
+
+    # ── Per-domain stats ───────────────────────────────────────────────────────
+
+    async def record_domain_queued(self, domain: str):
+        await self.redis.hincrby(f"domain_stats:{self.job_id}", f"{domain}:queued", 1)
+
+    async def record_domain_done(self, domain: str, fetch_ms: float):
+        pipe = self.redis.pipeline()
+        pipe.hincrby(f"domain_stats:{self.job_id}", f"{domain}:done", 1)
+        # Running sum for average — we store sum and count separately
+        pipe.incrbyfloat(f"domain_latency_sum:{self.job_id}", fetch_ms)
+        pipe.hincrby(f"domain_stats:{self.job_id}", f"{domain}:latency_sum", int(fetch_ms))
+        pipe.hincrby(f"domain_stats:{self.job_id}", f"{domain}:latency_count", 1)
+        await pipe.execute()
+
+    async def record_domain_active(self, domain: str, worker_id: str):
+        await self.redis.hset(f"domain_active:{self.job_id}", domain, worker_id)
+
+    async def record_domain_idle(self, domain: str):
+        await self.redis.hdel(f"domain_active:{self.job_id}", domain)
+
+    async def get_domain_stats(self) -> list[dict]:
+        pipe = self.redis.pipeline()
+        pipe.hgetall(f"domain_stats:{self.job_id}")
+        pipe.hgetall(f"domain_active:{self.job_id}")
+        results = await pipe.execute()
+        raw, active = results[0], results[1]
+
+        # Aggregate per-domain
+        domains: dict[str, dict] = {}
+        for key, val in raw.items():
+            domain, metric = key.rsplit(":", 1)
+            if domain not in domains:
+                domains[domain] = {
+                    "domain": domain, "queued": 0, "done": 0,
+                    "latency_sum": 0, "latency_count": 0,
+                }
+            domains[domain][metric] = int(val)
+
+        out = []
+        for domain, d in domains.items():
+            avg_ms = (d["latency_sum"] / d["latency_count"]) if d["latency_count"] else 0
+            out.append({
+                "domain": domain,
+                "queued": d["queued"],
+                "done": d["done"],
+                "avg_fetch_ms": round(avg_ms, 1),
+                "active_worker": active.get(domain),
+                "queue_shard": _domain_shard(domain),
+            })
+        out.sort(key=lambda x: x["done"], reverse=True)
+        return out
 
     async def clear(self):
         pipe = self.redis.pipeline()

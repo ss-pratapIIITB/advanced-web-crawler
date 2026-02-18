@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     celery_result_backend: str = "redis://localhost:6379/2"
     worker_prefetch_multiplier: int = 1
 
+    # Domain-sharded queues — parallel I/O across domains
+    # Each domain hashes to one of these shards so politeness is maintained
+    # per domain while different domains crawl fully in parallel.
+    num_domain_queues: int = 16
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

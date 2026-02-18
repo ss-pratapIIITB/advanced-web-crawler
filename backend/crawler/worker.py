@@ -2,19 +2,29 @@
 Celery worker tasks.
 Each worker processes URLs from the Redis frontier, emits events at every step,
 and stores results to the database. Multiple workers can run on separate machines.
+
+Queue architecture
+------------------
+URLs are routed to domain-sharded queues: crawl.0 … crawl.{N-1}
+  domain → shard = md5(domain) % NUM_DOMAIN_QUEUES
+
+This means:
+  • Different domains process fully in parallel (no I/O head-of-line blocking)
+  • Same domain always hits the same shard → politeness delay works correctly
+  • Scale horizontally by adding workers assigned to any subset of shards
 """
 import asyncio
+import hashlib
 import json
 import os
-import platform
 import socket
 import time
 from datetime import datetime
 from typing import Optional
 
 import redis
-from celery import Celery, Task
-from celery.signals import worker_ready, worker_shutdown, worker_process_init
+from celery import Celery
+from celery.signals import worker_ready, worker_shutdown
 from celery.utils.log import get_task_logger
 
 from backend.config import settings
@@ -25,6 +35,21 @@ from backend.crawler.filters import URLFilter, ContentFilter, normalize_url
 from backend.crawler.parser import parse_html
 
 logger = get_task_logger(__name__)
+
+# ── Domain-sharded queue routing ───────────────────────────────────────────────
+
+def get_domain_queue(url: str) -> str:
+    """Return the domain-sharded queue name for a URL."""
+    domain = _get_domain(url)
+    shard = int(hashlib.md5(domain.encode()).hexdigest(), 16) % settings.num_domain_queues
+    return f"crawl.{shard}"
+
+def get_queue_shard(url: str) -> int:
+    domain = _get_domain(url)
+    return int(hashlib.md5(domain.encode()).hexdigest(), 16) % settings.num_domain_queues
+
+# All domain shard queue names (workers subscribe to all of them by default)
+ALL_CRAWL_QUEUES = [f"crawl.{i}" for i in range(settings.num_domain_queues)]
 
 app = Celery("crawler")
 app.config_from_object({
@@ -38,6 +63,8 @@ app.config_from_object({
     "task_acks_late": True,
     "task_reject_on_worker_lost": True,
     "worker_max_tasks_per_child": 500,
+    # Declare all domain shard queues
+    "task_queues": {q: {"exchange": q, "routing_key": q} for q in ALL_CRAWL_QUEUES},
 })
 
 # Sync Redis client for workers (Celery is sync)
@@ -122,10 +149,14 @@ def process_url(
     """
     Main crawl task. Processes a single URL through the full pipeline:
     fetch → filter content → parse → extract links → store → queue new URLs
+
+    Each URL is routed to a domain-sharded queue (crawl.N) so that slow I/O
+    on one domain never blocks work on a different domain.
     """
-    import aiohttp
     wid = get_worker_id()
     r = get_redis()
+    domain = _get_domain(url)
+    shard = get_queue_shard(url)
 
     # --- Worker heartbeat ---
     state_json = r.hget(settings.redis_workers_key, wid)
@@ -138,6 +169,9 @@ def process_url(
     })
     update_worker_state(worker_state)
 
+    # Track domain as active
+    r.hset(f"domain_active:{job_id}", domain, wid)
+
     # Emit: fetching started
     emit_sync(CrawlEvent(
         event_type=EventType.URL_FETCHING,
@@ -147,6 +181,8 @@ def process_url(
         depth=depth,
         status=URLStatus.FETCHING,
         worker_id=wid,
+        domain=domain,
+        queue_shard=shard,
     ))
 
     # --- Robots.txt check ---
@@ -154,8 +190,9 @@ def process_url(
         allowed = _check_robots(url, r, job_id)
         if not allowed:
             _discard(url, depth, parent_url, job_id, wid,
-                     DiscardReason.ROBOTS_TXT, "Blocked by robots.txt", r)
-            _idle_worker(wid, worker_state, r)
+                     DiscardReason.ROBOTS_TXT, "Blocked by robots.txt", r,
+                     domain=domain, shard=shard)
+            _idle_worker(wid, worker_state, r, domain, job_id)
             return
 
     # --- Domain politeness ---
@@ -171,8 +208,9 @@ def process_url(
     except Exception as e:
         logger.error(f"Fetch error {url}: {e}")
         _discard(url, depth, parent_url, job_id, wid,
-                 DiscardReason.CONNECTION_ERROR, str(e), r)
-        _idle_worker(wid, worker_state, r)
+                 DiscardReason.CONNECTION_ERROR, str(e), r,
+                 domain=domain, shard=shard)
+        _idle_worker(wid, worker_state, r, domain, job_id)
         return
 
     fetch_ms = (time.monotonic() - start) * 1000
@@ -184,14 +222,16 @@ def process_url(
     # --- HTTP error check ---
     if result.discard_reason:
         _discard(url, depth, parent_url, job_id, wid,
-                 result.discard_reason, result.error or "", r)
-        _idle_worker(wid, worker_state, r)
+                 result.discard_reason, result.error or "", r,
+                 domain=domain, shard=shard)
+        _idle_worker(wid, worker_state, r, domain, job_id)
         return
 
     if result.status_code >= 400:
         _discard(url, depth, parent_url, job_id, wid,
-                 DiscardReason.HTTP_ERROR, f"HTTP {result.status_code}", r)
-        _idle_worker(wid, worker_state, r)
+                 DiscardReason.HTTP_ERROR, f"HTTP {result.status_code}", r,
+                 domain=domain, shard=shard)
+        _idle_worker(wid, worker_state, r, domain, job_id)
         return
 
     # --- Content type filter ---
@@ -204,8 +244,9 @@ def process_url(
         result.content_type, len(result.content) if result.content else 0
     )
     if not ok:
-        _discard(url, depth, parent_url, job_id, wid, reason, detail, r)
-        _idle_worker(wid, worker_state, r)
+        _discard(url, depth, parent_url, job_id, wid, reason, detail, r,
+                 domain=domain, shard=shard)
+        _idle_worker(wid, worker_state, r, domain, job_id)
         return
 
     # Emit: fetched
@@ -221,6 +262,8 @@ def process_url(
         fetch_duration_ms=fetch_ms,
         worker_id=wid,
         status=URLStatus.FETCHED,
+        domain=domain,
+        queue_shard=shard,
     ))
 
     # --- Parse ---
@@ -231,14 +274,17 @@ def process_url(
         depth=depth,
         worker_id=wid,
         status=URLStatus.PARSING,
+        domain=domain,
+        queue_shard=shard,
     ))
 
     try:
         parse_result = parse_html(result.final_url, result.content)
     except Exception as e:
         _discard(url, depth, parent_url, job_id, wid,
-                 DiscardReason.PARSE_ERROR, str(e), r)
-        _idle_worker(wid, worker_state, r)
+                 DiscardReason.PARSE_ERROR, str(e), r,
+                 domain=domain, shard=shard)
+        _idle_worker(wid, worker_state, r, domain, job_id)
         return
 
     # --- Store page ---
@@ -299,6 +345,9 @@ def process_url(
         # Dedup
         url_hash = _hash_url(abs_url)
         is_new = r.sadd(seen_key, url_hash)
+        child_domain = _get_domain(abs_url)
+        child_shard = get_queue_shard(abs_url)
+
         if not is_new:
             emit_sync(CrawlEvent(
                 event_type=EventType.URL_DISCARDED,
@@ -310,14 +359,19 @@ def process_url(
                 discard_detail="Already seen",
                 worker_id=wid,
                 status=URLStatus.DISCARDED,
+                domain=child_domain,
+                queue_shard=child_shard,
             ))
             continue
 
-        # Queue
+        # Queue to domain-sharded queue
         score = new_depth * 1000 + time.time() % 1000
         r.zadd(frontier_key, {abs_url: score})
         r.hincrby(f"stats:{job_id}", "queued", 1)
+        r.hincrby(f"domain_stats:{job_id}", f"{child_domain}:queued", 1)
         accepted_count += 1
+
+        target_queue = get_domain_queue(abs_url)
 
         emit_sync(CrawlEvent(
             event_type=EventType.URL_QUEUED,
@@ -329,18 +383,24 @@ def process_url(
             status=URLStatus.QUEUED,
             source_url=url,
             target_url=abs_url,
+            domain=child_domain,
+            queue_shard=child_shard,
         ))
 
-        # Queue Celery task for this URL
+        # Route to domain-sharded queue — parallel I/O across domains
         process_url.apply_async(
             args=[job_id, abs_url, new_depth, url, job_config],
-            queue="crawl",
+            queue=target_queue,
             priority=new_depth,
         )
 
     # Mark done
     r.hset(f"url_state:{job_id}", url, "done")
     r.hincrby(f"stats:{job_id}", "done", 1)
+    # Per-domain done + latency
+    r.hincrby(f"domain_stats:{job_id}", f"{domain}:done", 1)
+    r.hincrby(f"domain_stats:{job_id}", f"{domain}:latency_sum", int(fetch_ms))
+    r.hincrby(f"domain_stats:{job_id}", f"{domain}:latency_count", 1)
 
     emit_sync(CrawlEvent(
         event_type=EventType.URL_STORED,
@@ -351,6 +411,8 @@ def process_url(
         links_found=len(parse_result.links),
         worker_id=wid,
         status=URLStatus.DONE,
+        domain=domain,
+        queue_shard=shard,
     ))
 
     # Update worker stats
@@ -358,7 +420,7 @@ def process_url(
     worker_state["bytes_downloaded"] = (
         worker_state.get("bytes_downloaded", 0) + (len(result.content) if result.content else 0)
     )
-    _idle_worker(wid, worker_state, r)
+    _idle_worker(wid, worker_state, r, domain, job_id)
 
 
 # ── Heartbeat task ─────────────────────────────────────────────────────────────
@@ -388,7 +450,8 @@ async def _async_fetch(url: str, use_playwright: bool = False):
         return await fetcher.fetch(url, use_playwright=use_playwright)
 
 
-def _discard(url, depth, parent_url, job_id, wid, reason, detail, r):
+def _discard(url, depth, parent_url, job_id, wid, reason, detail, r,
+             domain=None, shard=None):
     emit_sync(CrawlEvent(
         event_type=EventType.URL_DISCARDED,
         job_id=job_id,
@@ -399,18 +462,23 @@ def _discard(url, depth, parent_url, job_id, wid, reason, detail, r):
         discard_detail=detail,
         worker_id=wid,
         status=URLStatus.DISCARDED,
+        domain=domain,
+        queue_shard=shard,
     ))
     r.hset(f"url_state:{job_id}", url, "discarded")
     r.hincrby(f"stats:{job_id}", "discarded", 1)
 
 
-def _idle_worker(wid, state, r):
+def _idle_worker(wid, state, r, domain=None, job_id=None):
     state.update({
         "status": "idle",
         "current_url": None,
         "last_heartbeat": datetime.utcnow().isoformat(),
     })
     update_worker_state(state)
+    # Mark domain as no longer active under this worker
+    if domain and job_id:
+        r.hdel(f"domain_active:{job_id}", domain)
 
 
 def _store_page(job_id, url, parent_url, depth, status_code, content_type,

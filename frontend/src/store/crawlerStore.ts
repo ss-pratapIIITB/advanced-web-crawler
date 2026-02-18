@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import type {
   CrawlJob, CrawlEvent, WorkerState, URLEntry,
-  GraphNode, GraphEdge, Metrics, URLStatus
+  GraphNode, GraphEdge, Metrics, URLStatus, DomainStats
 } from '../types'
 
 const MAX_EVENTS = 2000
@@ -22,6 +22,8 @@ interface CrawlerState {
   graphEdges: GraphEdge[]
   workers: Record<string, WorkerState>
   metrics: Record<string, MetricsState>
+  // domain → live stats (keyed by job_id → domain → stats)
+  domains: Record<string, Record<string, DomainStats>>
   wsConnected: boolean
   selectedUrl: string | null
 
@@ -30,6 +32,7 @@ interface CrawlerState {
   updateJob: (job: CrawlJob) => void
   ingestEvent: (event: CrawlEvent) => void
   setWorkers: (workers: WorkerState[]) => void
+  setDomains: (jobId: string, domains: DomainStats[]) => void
   setWsConnected: (v: boolean) => void
   setSelectedUrl: (url: string | null) => void
 }
@@ -46,6 +49,7 @@ export const useCrawlerStore = create<CrawlerState>((set, get) => ({
   graphEdges: [],
   workers: {},
   metrics: {},
+  domains: {},
   wsConnected: false,
   selectedUrl: null,
 
@@ -74,6 +78,12 @@ export const useCrawlerStore = create<CrawlerState>((set, get) => ({
 
   setWsConnected: (v) => set({ wsConnected: v }),
   setSelectedUrl: (url) => set({ selectedUrl: url }),
+
+  setDomains: (jobId, domainList) => set(s => {
+    const map: Record<string, DomainStats> = {}
+    domainList.forEach(d => { map[d.domain] = d })
+    return { domains: { ...s.domains, [jobId]: map } }
+  }),
 
   ingestEvent: (event) => {
     const s = get()
@@ -190,6 +200,40 @@ export const useCrawlerStore = create<CrawlerState>((set, get) => ({
       newMetrics = { ...s.metrics, [event.job_id]: updated }
     }
 
+    // --- Domain stats (live updates from events) ---
+    let newDomains = s.domains
+    if (event.domain && event.job_id && event.job_id !== '__system__') {
+      const jobDomains = { ...(s.domains[event.job_id] ?? {}) }
+      const prev = jobDomains[event.domain] ?? {
+        domain: event.domain,
+        queued: 0, done: 0,
+        avg_fetch_ms: 0,
+        active_worker: null,
+        queue_shard: event.queue_shard ?? 0,
+        queue_name: `crawl.${event.queue_shard ?? 0}`,
+      }
+      const updated = { ...prev }
+
+      if (event.event_type === 'url_queued') updated.queued = prev.queued + 1
+      if (event.event_type === 'url_stored') {
+        updated.done = prev.done + 1
+        if (event.fetch_duration_ms) {
+          // Running average
+          const total = prev.avg_fetch_ms * (prev.done || 1) + event.fetch_duration_ms
+          updated.avg_fetch_ms = Math.round(total / (updated.done))
+        }
+      }
+      if (event.event_type === 'url_fetching') {
+        updated.active_worker = event.worker_id ?? null
+      }
+      if (event.event_type === 'url_stored' || event.event_type === 'url_discarded') {
+        updated.active_worker = null
+      }
+
+      jobDomains[event.domain] = updated
+      newDomains = { ...s.domains, [event.job_id]: jobDomains }
+    }
+
     // --- Job status ---
     let newJobs = s.jobs
     if (event.event_type === 'job_started' && s.jobs[event.job_id]) {
@@ -207,6 +251,7 @@ export const useCrawlerStore = create<CrawlerState>((set, get) => ({
       graphNodes: newNodes,
       graphEdges: newEdges,
       metrics: newMetrics,
+      domains: newDomains,
       jobs: newJobs,
     })
   },

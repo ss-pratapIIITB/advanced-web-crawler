@@ -130,10 +130,11 @@ async def start_job(job_id: str):
             status=URLStatus.QUEUED,
         ))
 
-        # Dispatch worker task
+        # Route seed URL to its domain-sharded queue
+        from backend.crawler.worker import get_domain_queue
         process_url.apply_async(
             args=[job_id, url, 0, None, config],
-            queue="crawl",
+            queue=get_domain_queue(url),
         )
 
     await r.aclose()
@@ -273,6 +274,53 @@ async def get_graph(job_id: str, limit: int = Query(500, le=2000)):
             edges.append({"source": p.parent_url, "target": p.url})
 
     return {"nodes": nodes, "edges": edges}
+
+
+@router.get("/jobs/{job_id}/domains")
+async def get_domains(job_id: str):
+    """Per-domain crawl stats + which queue shard each domain is on."""
+    r = aioredis.from_url(settings.redis_url, decode_responses=True)
+    raw = await r.hgetall(f"domain_stats:{job_id}")
+    active = await r.hgetall(f"domain_active:{job_id}")
+    await r.aclose()
+
+    from backend.crawler.worker import get_queue_shard
+    domains: dict[str, dict] = {}
+    for key, val in raw.items():
+        domain, metric = key.rsplit(":", 1)
+        if domain not in domains:
+            domains[domain] = {"domain": domain, "queued": 0, "done": 0,
+                               "latency_sum": 0, "latency_count": 0}
+        domains[domain][metric] = int(val)
+
+    result = []
+    for domain, d in domains.items():
+        avg_ms = (d["latency_sum"] / d["latency_count"]) if d["latency_count"] else 0
+        result.append({
+            "domain": domain,
+            "queued": d["queued"],
+            "done": d["done"],
+            "avg_fetch_ms": round(avg_ms, 1),
+            "active_worker": active.get(domain),
+            "queue_shard": get_queue_shard(f"https://{domain}/"),
+            "queue_name": f"crawl.{get_queue_shard(f'https://{domain}/')}",
+        })
+    result.sort(key=lambda x: x["done"], reverse=True)
+    return result
+
+
+@router.get("/queues/stats")
+async def get_queue_stats():
+    """Depth of every domain-sharded queue in the broker."""
+    from backend.config import settings as cfg
+    r = aioredis.from_url(cfg.celery_broker_url, decode_responses=True)
+    queues = {}
+    for i in range(cfg.num_domain_queues):
+        name = f"crawl.{i}"
+        depth = await r.llen(name)
+        queues[name] = depth
+    await r.aclose()
+    return queues
 
 
 @router.get("/workers")

@@ -9,10 +9,11 @@ import { URLTable } from './URLTable'
 import { WorkerPanel } from './WorkerPanel'
 import { URLDetail } from './URLDetail'
 import { CreateJobModal } from './CreateJobModal'
+import { DomainPanel } from './DomainPanel'
 import { Plus, Play, Pause, Square, RefreshCw, Spider } from 'lucide-react'
 import type { CrawlJob } from '../types'
 
-type View = 'graph' | 'table' | 'feed'
+type View = 'graph' | 'table' | 'feed' | 'domains'
 
 export function Dashboard() {
   const { activeJobId, setActiveJob, setJobs, updateJob, setWorkers } = useCrawlerStore()
@@ -143,7 +144,7 @@ export function Dashboard() {
 
           {/* View switcher */}
           <div className="ml-auto flex gap-1 bg-surface rounded-lg p-0.5">
-            {(['graph', 'table', 'feed'] as View[]).map(v => (
+            {(['graph', 'table', 'feed', 'domains'] as View[]).map(v => (
               <button
                 key={v}
                 onClick={() => setView(v)}
@@ -176,9 +177,13 @@ export function Dashboard() {
             <div className="h-full p-4 overflow-hidden flex flex-col">
               <URLTable jobId={activeJobId} />
             </div>
-          ) : (
+          ) : view === 'feed' ? (
             <div className="h-full p-4 overflow-hidden flex flex-col">
               <EventFeed jobId={activeJobId} />
+            </div>
+          ) : (
+            <div className="h-full p-4 overflow-hidden flex flex-col">
+              <DomainPanel jobId={activeJobId} />
             </div>
           )}
 

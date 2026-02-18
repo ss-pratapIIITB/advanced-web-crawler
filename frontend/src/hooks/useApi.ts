@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { CrawlJob, WorkerState, CreateJobPayload, Metrics } from '../types'
+import type { CrawlJob, WorkerState, CreateJobPayload, Metrics, DomainStats, QueueStats } from '../types'
 
 const api = axios.create({ baseURL: '/api/v1' })
 
@@ -17,4 +17,6 @@ export const CrawlerAPI = {
     api.get(`/jobs/${id}/discards?limit=${limit}${reason ? `&reason=${reason}` : ''}`).then(r => r.data),
   getWorkers: () => api.get<WorkerState[]>('/workers').then(r => r.data),
   getMetrics: (id: string) => api.get<Metrics>(`/jobs/${id}/metrics`).then(r => r.data),
+  getDomains: (id: string) => api.get<DomainStats[]>(`/jobs/${id}/domains`).then(r => r.data),
+  getQueueStats: () => api.get<QueueStats>('/queues/stats').then(r => r.data),
 }

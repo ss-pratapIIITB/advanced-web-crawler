@@ -109,6 +109,10 @@ class CrawlEvent(BaseModel):
     source_url: Optional[str] = None
     target_url: Optional[str] = None
 
+    # Domain info (for parallel queue visualization)
+    domain: Optional[str] = None
+    queue_shard: Optional[int] = None
+
     def to_redis_dict(self) -> dict[str, str]:
         data = self.model_dump(mode="json", exclude_none=True)
         return {k: str(v) for k, v in data.items()}

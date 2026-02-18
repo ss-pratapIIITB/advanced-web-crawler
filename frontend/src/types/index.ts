@@ -49,6 +49,8 @@ export interface CrawlEvent {
   metrics?: Record<string, number>
   source_url?: string
   target_url?: string
+  domain?: string
+  queue_shard?: number
 }
 
 export interface CrawlJob {
@@ -107,6 +109,20 @@ export interface Metrics {
   discarded: number
   error: number
   frontier_depth: number
+}
+
+export interface DomainStats {
+  domain: string
+  queued: number
+  done: number
+  avg_fetch_ms: number
+  active_worker: string | null
+  queue_shard: number
+  queue_name: string
+}
+
+export interface QueueStats {
+  [queueName: string]: number   // queue name → pending task count
 }
 
 export interface CreateJobPayload {
