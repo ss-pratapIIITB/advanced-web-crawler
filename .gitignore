@@ -23,10 +23,11 @@ pip-wheel-metadata/
 *.pem
 secrets.yml
 
-# SQLite DB (local dev data)
+# SQLite DB / Redis dumps (local dev data)
 *.db
 *.sqlite
 *.sqlite3
+dump.rdb
 
 # Celery
 celerybeat-schedule
